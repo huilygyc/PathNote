@@ -24,7 +24,7 @@ from .hover_bubble import HoverAliasBubble
 from .inline_overlay import InlineAliasOverlay
 from .main_window import MainWindow
 from .quick_search import QuickSearchLauncher
-from .theme import create_app_icon, get_stylesheet
+from .theme import create_app_icon, create_tray_icon, get_stylesheet
 from .toast import StatusToast
 
 
@@ -125,11 +125,12 @@ class FileAliasController(QObject):
     def _refresh_tray_appearance(self) -> None:
         cfg = self.config_mgr.config
         enabled = cfg.alias_enabled
-        self.tray.setIcon(create_app_icon(enabled))
-        state_str = "已开启" if enabled else "已关闭"
+        self.app.setWindowIcon(create_app_icon())
+        self.tray.setIcon(create_tray_icon(enabled))
+        state_str = "已开启" if enabled else "已暂停"
         self.tray.setToolTip(
-            f"FileAlias 影名 — 别名显示：{state_str}\n"
-            f"开关：{cfg.hotkey_toggle}  |  设别名：{cfg.hotkey_quick_add}  |  查询：{cfg.hotkey_search}"
+            f"PathNote · 路径备注 — {state_str}\n"
+            f"开关：{cfg.hotkey_toggle}  |  设备注：{cfg.hotkey_quick_add}  |  查询：{cfg.hotkey_search}"
         )
         self._act_toggle.setText(
             f"{'关闭' if enabled else '开启'}行尾别名显示 ({cfg.hotkey_toggle})"

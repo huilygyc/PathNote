@@ -8,7 +8,8 @@ import winreg
 
 
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE_NAME = "FileAlias"
+RUN_VALUE_NAME = "PathNote"
+LEGACY_VALUE_NAME = "FileAlias"
 
 
 def get_autostart_command() -> str:
@@ -25,8 +26,14 @@ def get_autostart_command() -> str:
 def is_autostart_enabled() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_READ) as key:
-            val, _ = winreg.QueryValueEx(key, RUN_VALUE_NAME)
-            return bool(val)
+            for name in (RUN_VALUE_NAME, LEGACY_VALUE_NAME):
+                try:
+                    val, _ = winreg.QueryValueEx(key, name)
+                    if val:
+                        return True
+                except FileNotFoundError:
+                    continue
+            return False
     except OSError:
         return False
 
@@ -34,6 +41,10 @@ def is_autostart_enabled() -> bool:
 def set_autostart_enabled(enabled: bool) -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, LEGACY_VALUE_NAME)
+            except FileNotFoundError:
+                pass
             if enabled:
                 winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, get_autostart_command())
             else:

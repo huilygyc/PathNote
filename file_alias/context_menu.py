@@ -10,8 +10,9 @@ import sys
 import winreg
 
 
-MENU_KEY_NAME = "FileAliasSetAlias"
-MENU_LABEL = "设置中文别名 / 用途 (FileAlias)"
+MENU_KEY_NAME = "PathNoteSetAlias"
+LEGACY_MENU_KEY = "FileAliasSetAlias"
+MENU_LABEL = "设置路径备注 (PathNote)"
 
 _TARGETS = [
     (r"Software\Classes\*\shell", "%1"),
@@ -60,13 +61,14 @@ def unregister_context_menu() -> bool:
     """Cleanly remove Explorer right-click menu entries from HKCU."""
     ok = True
     for base_shell, _ in _TARGETS:
-        cmd_path = f"{base_shell}\\{MENU_KEY_NAME}\\command"
-        menu_path = f"{base_shell}\\{MENU_KEY_NAME}"
-        for sub in (cmd_path, menu_path):
-            try:
-                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                ok = False
+        for kname in (MENU_KEY_NAME, LEGACY_MENU_KEY):
+            cmd_path = f"{base_shell}\\{kname}\\command"
+            menu_path = f"{base_shell}\\{kname}"
+            for sub in (cmd_path, menu_path):
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    ok = False
     return ok

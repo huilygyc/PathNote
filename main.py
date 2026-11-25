@@ -18,7 +18,7 @@ from file_alias.storage import AliasStore
 from file_alias.ui.tray import FileAliasController
 
 
-IPC_SERVER_NAME = "FileAlias_SingleInstance_v1"
+IPC_SERVER_NAME = "PathNote_SingleInstance_v1"
 
 
 def seed_first_run_examples(store: AliasStore) -> None:
@@ -26,10 +26,10 @@ def seed_first_run_examples(store: AliasStore) -> None:
     proj_dir = Path(__file__).resolve().parent
     store.upsert(
         proj_dir,
-        alias="FileAlias 影名项目主目录",
-        note="Windows 英文路径文件与文件夹别名助手源码目录",
-        tags=["FileAlias", "工具源码"],
-        color="#3B82F6",
+        alias="PathNote 项目主目录",
+        note="Windows 英文路径原位备注助手源码目录",
+        tags=["PathNote", "源码"],
+        color="#0F6CBD",
         pinned=True,
     )
     samples = [
@@ -57,18 +57,18 @@ def send_ipc_command(cmd: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="FileAlias 影名 - 英文路径文件别名助手")
+    parser = argparse.ArgumentParser(description="PathNote · 路径备注 - 英文路径原位备注助手")
     parser.add_argument("--minimized", action="store_true", help="启动后仅驻留系统托盘，不弹出主窗口")
-    parser.add_argument("--toggle", action="store_true", help="切换已运行实例的别名显示开关")
+    parser.add_argument("--toggle", action="store_true", help="切换已运行实例的备注显示开关")
     parser.add_argument("--search", action="store_true", help="唤起已运行实例的全局快速查询面板")
-    parser.add_argument("--edit", type=str, default="", help="为指定路径直接弹出设置别名窗口")
+    parser.add_argument("--edit", type=str, default="", help="为指定路径直接弹出设置备注窗口")
     args = parser.parse_args()
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication(sys.argv)
-    app.setApplicationName("FileAlias")
+    app.setApplicationName("PathNote")
 
     if args.edit and send_ipc_command(f"edit|{args.edit}"):
         return 0
@@ -116,7 +116,7 @@ def main() -> int:
         controller.show_main_window()
     else:
         hk = controller.config_mgr.config.hotkey_toggle
-        controller.toast.show_toast(f"FileAlias 已在后台就绪 ({hk} 开关别名)", "#38BDF8")
+        controller.toast.show_toast(f"PathNote 已在后台就绪 ({hk} 开关显示)", "#2563EB")
 
     return app.exec()
 

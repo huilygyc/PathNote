@@ -28,7 +28,7 @@ def _resolve_default_data_dir() -> Path:
             return portable_dir
         except OSError:
             appdata = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-            fallback = appdata / "FileAlias" / "data"
+            fallback = appdata / "PathNote" / "data"
             fallback.mkdir(parents=True, exist_ok=True)
             return fallback
     return Path(__file__).resolve().parent.parent / "data"

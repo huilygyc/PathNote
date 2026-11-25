@@ -169,7 +169,7 @@ class MainWindow(QMainWindow):
         self._current_nav = "all"  # "all" | "dirs" | "files" | "cat:<name>" | "settings"
         self._selected_inline_color = self.config_mgr.config.inline_text_color or "#0F6CBD"
 
-        self.setWindowTitle("影名 FileAlias")
+        self.setWindowTitle("PathNote · 路径备注")
         self.resize(980, 630)
         self.setMinimumSize(800, 520)
         self.setAcceptDrops(True)
@@ -220,9 +220,9 @@ class MainWindow(QMainWindow):
         b_text = QVBoxLayout()
         b_text.setContentsMargins(0, 0, 0, 0)
         b_text.setSpacing(0)
-        t1 = QLabel("影名 FileAlias")
-        t1.setStyleSheet("font-size: 14.5px; font-weight: 700; color: #18181B;")
-        t2 = QLabel("英文路径行尾备注")
+        t1 = QLabel("PathNote")
+        t1.setStyleSheet("font-size: 15px; font-weight: 700; color: #18181B;")
+        t2 = QLabel("路径备注助手")
         t2.setStyleSheet("font-size: 11px; color: #71717A;")
         b_text.addWidget(t1)
         b_text.addWidget(t2)
