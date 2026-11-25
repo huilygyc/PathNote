@@ -7,16 +7,17 @@ suffix rendering, optional Companion Panel / Hover Bubble, Quick Search, and Mai
 from __future__ import annotations
 
 import os
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QFileSystemWatcher, QObject
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from ..config import ConfigManager
 from ..hotkeys import GlobalHotkeyManager
 from ..inline_sensor import InlineSensorWorker, InlineViewSnapshot
-from ..models import DEFAULT_CATEGORY, HoverTarget, WindowContext, normalize_path
+from ..models import DEFAULT_CATEGORY, HoverTarget, WindowContext, normalize_key, normalize_path
 from ..storage import AliasStore
-from ..win_inspector import HoverSensorWorker, WindowInspector
+from ..win_events import WinEventMonitor
+from ..win_inspector import HoverSensorWorker, WindowInspector, _get_visible_frame_rect
 from .companion_panel import CompanionPanel
 from .edit_dialog import EditAliasDialog
 from .hover_bubble import HoverAliasBubble
@@ -44,11 +45,14 @@ class FileAliasController(QObject):
         self.app.setStyleSheet(get_stylesheet(self.config_mgr.config.theme))
         self.app.setQuitOnLastWindowClosed(False)
 
-        # Core Services & Sensors
+        # Core Services & Event-Driven Sensors
         self.hotkeys = GlobalHotkeyManager(self)
+        self.win_events = WinEventMonitor(self)
         self.inspector = WindowInspector(own_pid=os.getpid(), parent=self)
-        self.inline_worker = InlineSensorWorker(self.store, parent=self)
+        self.inline_worker = InlineSensorWorker(self.store, own_pid=os.getpid(), parent=self)
         self.hover_worker = HoverSensorWorker(own_pid=os.getpid(), parent=self)
+        self._dir_watcher = QFileSystemWatcher(self)
+        self._watched_dir: str = ""
 
         # UI Surfaces
         self.toast = StatusToast()
@@ -66,9 +70,10 @@ class FileAliasController(QObject):
         self._setup_tray()
         self._connect_signals()
 
-        # Activate hotkeys & background sensors
+        # Activate hotkeys & event-driven sensors
         self.apply_hotkeys()
         self._sync_sensor_state()
+        self.win_events.start()
         self.inspector.start()
         self.inline_worker.start()
         self.hover_worker.start()
@@ -136,8 +141,14 @@ class FileAliasController(QObject):
 
     def _connect_signals(self) -> None:
         self.hotkeys.triggered.connect(self._on_hotkey_triggered)
+        self.win_events.foregroundOrStateChanged.connect(self.inspector.force_refresh)
+        self.win_events.trackedWindowMoved.connect(self._on_tracked_window_moved)
+        self.win_events.viewContentChanged.connect(lambda: self.inline_worker.request_refresh(0.45))
+        self._dir_watcher.directoryChanged.connect(self._on_active_dir_fs_changed)
+
         self.inspector.contextChanged.connect(self._on_window_context_changed)
         self.inline_worker.snapshotChanged.connect(self._on_inline_snapshot_changed)
+        self.inline_worker.pathsReconciled.connect(self._on_paths_reconciled)
         self.hover_worker.hoverChanged.connect(self._on_hover_changed)
 
         # Companion signals
@@ -238,6 +249,7 @@ class FileAliasController(QObject):
             self.toast.show_toast(f"文件别名显示：已关闭 ({hk})", "#94A3B8")
 
     def open_quick_search(self) -> None:
+        self.store.reconcile_moved_files(force=True)
         ctx = self.inspector.current_context or self._last_valid_ctx
         self.inline_overlay.hide()
         self.quick_search.open_with_context(ctx)
@@ -284,6 +296,7 @@ class FileAliasController(QObject):
 
     def show_main_window(self) -> None:
         self.inline_overlay.hide()
+        self.store.reconcile_moved_files(force=True)
         self.main_window.refresh_table()
         self.main_window.showNormal()
         self.main_window.raise_()
@@ -297,11 +310,45 @@ class FileAliasController(QObject):
 
     # ---- Sensor Callbacks ----
 
+    def _on_tracked_window_moved(self, hwnd: int) -> None:
+        new_rect = _get_visible_frame_rect(hwnd)
+        if not self.inline_overlay.sync_host_window_move(new_rect):
+            # Window resized -> wake UIA sensor for layout update
+            self.inline_worker.request_refresh(0.30)
+        if self.companion.isVisible() and self._last_valid_ctx and self._last_valid_ctx.hwnd == hwnd:
+            self._last_valid_ctx.rect = new_rect
+            self.companion._dock_beside_target(self._last_valid_ctx)
+
+    def _on_active_dir_fs_changed(self, _path: str) -> None:
+        # File/folder renamed, moved, or created inside the active directory ->
+        # stay awake 1.4s so we catch Explorer's asynchronous ReadDirectoryChangesW UI redraw immediately!
+        self.inline_worker.request_refresh(1.40, force_reconcile=True)
+
+    def _on_paths_reconciled(self) -> None:
+        if self.main_window.isVisible():
+            self.main_window.refresh_table()
+        if self.companion.isVisible():
+            self.companion.refresh_all()
+
+    def _update_watched_dir(self, dir_path: str) -> None:
+        if normalize_key(dir_path) == normalize_key(self._watched_dir):
+            return
+        old = self._dir_watcher.directories()
+        if old:
+            self._dir_watcher.removePaths(old)
+        self._watched_dir = dir_path
+        if dir_path and os.path.isdir(dir_path):
+            self._dir_watcher.addPath(dir_path)
+
     def _on_window_context_changed(self, ctx: WindowContext | None) -> None:
         if ctx is not None:
             self._last_valid_ctx = ctx
+            self.win_events.set_tracked_hwnd(ctx.hwnd)
+            self._update_watched_dir(ctx.current_dir)
         else:
             self._last_valid_ctx = None
+            self.win_events.set_tracked_hwnd(0)
+            self._update_watched_dir("")
 
         self.inline_worker.set_context(ctx)
         self.hover_worker.set_context(ctx)
@@ -345,6 +392,7 @@ class FileAliasController(QObject):
             self.hover_bubble.hide()
 
     def shutdown(self) -> None:
+        self.win_events.stop()
         self.inspector.stop()
         self.inline_worker.stop_worker()
         self.hover_worker.stop_worker()

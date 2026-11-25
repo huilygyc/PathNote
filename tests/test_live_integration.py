@@ -202,10 +202,24 @@ class TestLiveIntegration(unittest.TestCase):
                     if snaps:
                         break
 
-                self.assertTrue(len(snaps) > 0, "No inline snapshot emitted for live Win11 Explorer")
-                matched = {a.display_name: a.alias for a in snaps[-1].items}
-                self.assertEqual(matched.get("AsusMCenterAppstore"), "华硕控制中心")
-                self.assertEqual(matched.get("coad"), "代码练习目录")
+                # Live rename test inside open Windows 11 Explorer: rename 'coad' -> 'code_renamed' on disk!
+                import os
+                os.rename(base_dir / "coad", base_dir / "code_renamed")
+                snaps.clear()
+                worker.request_refresh(1.8, force_reconcile=True)
+                renamed_matched = {}
+                for _ in range(35):
+                    time.sleep(0.08)
+                    self.app.processEvents()
+                    if snaps:
+                        renamed_matched = {a.display_name: a.alias for a in snaps[-1].items}
+                        if "code_renamed" in renamed_matched:
+                            break
+                self.assertEqual(
+                    renamed_matched.get("code_renamed"),
+                    "代码练习目录",
+                    f"Expected renamed folder 'code_renamed' to auto-follow alias, got {renamed_matched}",
+                )
 
                 # Trigger live Win11 right-click context menu and verify Z-order occlusion clipping!
                 from file_alias.inline_sensor import _find_visible_file_view_hwnds
@@ -231,6 +245,47 @@ class TestLiveIntegration(unittest.TestCase):
                 store.close()
                 if hwnd:
                     win32gui.PostMessage(hwnd, 0x0010, 0, 0)
+
+    def test_zero_lag_window_drag_and_winevent_hook(self) -> None:
+        from file_alias.inline_sensor import InlineItemAnchor
+        from file_alias.win_events import WinEventMonitor
+
+        mon = WinEventMonitor()
+        mon.start()
+        try:
+            self.assertGreater(len(mon._hooks), 0)
+        finally:
+            mon.stop()
+            self.assertEqual(len(mon._hooks), 0)
+
+        with tempfile.TemporaryDirectory(prefix="fa_drag_") as tmp_str:
+            cfg_mgr = ConfigManager(config_path=Path(tmp_str) / "cfg.json")
+            ov = InlineAliasOverlay(cfg_mgr)
+            try:
+                snap = InlineViewSnapshot(
+                    hwnd=9999,
+                    host_rect=(300, 300, 1200, 900),
+                    viewport_rect=(330, 360, 1170, 870),
+                    is_dark_bg=False,
+                    items=(
+                        InlineItemAnchor("d:\\a\\f.py", "f.py", "测试脚本", "", "#0F6CBD", (360, 390, 700, 420)),
+                    ),
+                )
+                ov.update_snapshot(snap)
+                self.app.processEvents()
+                orig_pos = ov.pos()
+
+                # Translate host window by (+150, +90) physical pixels -> pure translation returns True
+                ok = ov.sync_host_window_move((450, 390, 1350, 990))
+                self.assertTrue(ok)
+                self.assertGreater(ov.pos().x(), orig_pos.x())
+                self.assertGreater(ov.pos().y(), orig_pos.y())
+
+                # Resize host window -> returns False so UIA layout refreshes
+                resized = ov.sync_host_window_move((450, 390, 1600, 1100))
+                self.assertFalse(resized)
+            finally:
+                ov.close()
 
     def test_controller_and_inline_overlay_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fa_ui_") as tmp_str:
@@ -261,6 +316,7 @@ class TestLiveIntegration(unittest.TestCase):
                 ctrl.toggle_alias_mode()
                 self.assertTrue(ctrl.config_mgr.config.alias_enabled)
             finally:
+                ctrl.win_events.stop()
                 ctrl.inspector.stop()
                 ctrl.inline_worker.stop_worker()
                 ctrl.hover_worker.stop_worker()

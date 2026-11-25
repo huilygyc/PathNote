@@ -11,6 +11,7 @@ import time
 from typing import Iterable
 
 from .config import DEFAULT_DATA_DIR
+from .file_id import get_file_identity, resolve_path_by_identity
 from .models import (
     DEFAULT_CATEGORY,
     AliasEntry,
@@ -41,8 +42,10 @@ class AliasStore:
         self._by_key: dict[str, AliasEntry] = {}
         self._by_parent: dict[str, dict[str, AliasEntry]] = {}
         self._categories: list[str] = [DEFAULT_CATEGORY]
+        self._last_reconcile_ts: float = 0.0
         self._init_schema()
         self._reload_cache()
+        self._backfill_missing_identities()
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -51,21 +54,23 @@ class AliasStore:
             self._conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS aliases (
-                    path_key    TEXT PRIMARY KEY,
-                    path        TEXT NOT NULL,
-                    alias       TEXT NOT NULL,
-                    note        TEXT NOT NULL DEFAULT '',
-                    category    TEXT NOT NULL DEFAULT '{DEFAULT_CATEGORY}',
-                    tags_json   TEXT NOT NULL DEFAULT '[]',
-                    color       TEXT NOT NULL DEFAULT '#0F6CBD',
-                    is_dir      INTEGER NOT NULL DEFAULT 0,
-                    pinned      INTEGER NOT NULL DEFAULT 0,
-                    created_at  REAL NOT NULL,
-                    updated_at  REAL NOT NULL
+                    path_key      TEXT PRIMARY KEY,
+                    path          TEXT NOT NULL,
+                    alias         TEXT NOT NULL,
+                    note          TEXT NOT NULL DEFAULT '',
+                    category      TEXT NOT NULL DEFAULT '{DEFAULT_CATEGORY}',
+                    tags_json     TEXT NOT NULL DEFAULT '[]',
+                    color         TEXT NOT NULL DEFAULT '#0F6CBD',
+                    is_dir        INTEGER NOT NULL DEFAULT 0,
+                    pinned        INTEGER NOT NULL DEFAULT 0,
+                    volume_serial INTEGER NOT NULL DEFAULT 0,
+                    file_id       TEXT NOT NULL DEFAULT '0',
+                    created_at    REAL NOT NULL,
+                    updated_at    REAL NOT NULL
                 );
                 """
             )
-            # Non-destructive migration for existing databases created before `category` was added
+            # Non-destructive schema migrations for existing databases
             cols = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(aliases);").fetchall()
@@ -73,6 +78,15 @@ class AliasStore:
             if "category" not in cols:
                 self._conn.execute(
                     f"ALTER TABLE aliases ADD COLUMN category TEXT NOT NULL DEFAULT '{DEFAULT_CATEGORY}';"
+                )
+            if "volume_serial" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE aliases ADD COLUMN volume_serial INTEGER NOT NULL DEFAULT 0;"
+                )
+            if "file_id" not in cols:
+                # Stored as TEXT so unsigned 64-bit IDs > 2^63-1 never overflow SQLite signed INT64
+                self._conn.execute(
+                    "ALTER TABLE aliases ADD COLUMN file_id TEXT NOT NULL DEFAULT '0';"
                 )
 
             self._conn.execute(
@@ -97,6 +111,11 @@ class AliasStore:
         except Exception:
             tags = []
         raw_cat = row["category"] if "category" in row.keys() else DEFAULT_CATEGORY
+        vol_ser = int(row["volume_serial"] or 0) if "volume_serial" in row.keys() else 0
+        try:
+            fid = int(row["file_id"] or 0) if "file_id" in row.keys() else 0
+        except Exception:
+            fid = 0
         return AliasEntry(
             path=row["path"],
             path_key=row["path_key"],
@@ -107,6 +126,8 @@ class AliasStore:
             color=row["color"] or "#0F6CBD",
             is_dir=bool(row["is_dir"]),
             pinned=bool(row["pinned"]),
+            volume_serial=vol_ser,
+            file_id=fid,
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -169,6 +190,65 @@ class AliasStore:
             if not self._by_parent[old.parent_key]:
                 self._by_parent.pop(old.parent_key, None)
         return True
+
+    def _backfill_missing_identities(self) -> None:
+        """Populate NTFS (volume_serial, file_id) for legacy records that already exist on disk."""
+        with self._lock:
+            updated = False
+            for entry in list(self._by_key.values()):
+                if (entry.volume_serial == 0 or entry.file_id == 0) and os.path.exists(entry.path):
+                    ident = get_file_identity(entry.path)
+                    if ident:
+                        vol_ser, fid = ident
+                        entry.volume_serial = vol_ser
+                        entry.file_id = fid
+                        self._conn.execute(
+                            "UPDATE aliases SET volume_serial = ?, file_id = ? WHERE path_key = ?;",
+                            (vol_ser, str(fid), entry.path_key),
+                        )
+                        updated = True
+            if updated:
+                self._conn.commit()
+
+    def reconcile_moved_files(self, force: bool = False) -> int:
+        """
+        Automatically detect renamed or moved files/folders via NTFS FileId (`OpenFileById`)
+        and update their paths in SQLite + memory index seamlessly.
+        """
+        now = time.monotonic()
+        if not force and (now - self._last_reconcile_ts) < 0.65:
+            return 0
+        self._last_reconcile_ts = now
+
+        with self._lock:
+            missing = [
+                e for e in self._by_key.values()
+                if e.volume_serial and e.file_id and not os.path.exists(e.path)
+            ]
+
+        if not missing:
+            return 0
+
+        # Process parent folders before nested children so folder rename cascades cleanly
+        missing.sort(key=lambda e: len(e.path))
+        total_healed = 0
+
+        for entry in missing:
+            # Re-check in case an earlier parent-folder cascade already updated this child!
+            cur = self.get(entry.path)
+            if cur is None or os.path.exists(cur.path):
+                continue
+            resolved = resolve_path_by_identity(
+                cur.volume_serial,
+                cur.file_id,
+                hint_path=cur.path,
+            )
+            if resolved and normalize_key(resolved) != cur.path_key:
+                # Don't overwrite a distinct existing alias at target unless none exists
+                if self.get(resolved) is None:
+                    total_healed += self.relocate_path(cur.path, resolved)
+
+        return total_healed
 
     # ---- Category Management ----
 
@@ -292,6 +372,14 @@ class AliasStore:
                 (clean_cat, now),
             )
 
+            ident = get_file_identity(norm_path)
+            if ident is not None:
+                vol_ser, fid = ident
+            elif existing is not None:
+                vol_ser, fid = existing.volume_serial, existing.file_id
+            else:
+                vol_ser, fid = 0, 0
+
             entry = AliasEntry(
                 path=norm_path,
                 path_key=key,
@@ -302,14 +390,16 @@ class AliasStore:
                 color=color or "#0F6CBD",
                 is_dir=actual_is_dir,
                 pinned=bool(pinned),
+                volume_serial=vol_ser,
+                file_id=fid,
                 created_at=created_at,
                 updated_at=now,
             )
             self._conn.execute(
                 """
                 INSERT INTO aliases
-                (path_key, path, alias, note, category, tags_json, color, is_dir, pinned, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (path_key, path, alias, note, category, tags_json, color, is_dir, pinned, volume_serial, file_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_key) DO UPDATE SET
                     path = excluded.path,
                     alias = excluded.alias,
@@ -319,6 +409,8 @@ class AliasStore:
                     color = excluded.color,
                     is_dir = excluded.is_dir,
                     pinned = excluded.pinned,
+                    volume_serial = excluded.volume_serial,
+                    file_id = excluded.file_id,
                     updated_at = excluded.updated_at;
                 """,
                 (
@@ -331,6 +423,8 @@ class AliasStore:
                     entry.color,
                     int(entry.is_dir),
                     int(entry.pinned),
+                    entry.volume_serial,
+                    str(entry.file_id),
                     entry.created_at,
                     entry.updated_at,
                 ),
@@ -510,11 +604,13 @@ class AliasStore:
                 target_key = normalize_key(target_path)
                 self._conn.execute("DELETE FROM aliases WHERE path_key = ?", (entry.path_key,))
                 is_dir_val = os.path.isdir(target_path) if os.path.exists(target_path) else entry.is_dir
+                ident = get_file_identity(target_path)
+                vol_ser, fid = ident if ident else (entry.volume_serial, entry.file_id)
                 self._conn.execute(
                     """
                     INSERT OR REPLACE INTO aliases
-                    (path_key, path, alias, note, category, tags_json, color, is_dir, pinned, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (path_key, path, alias, note, category, tags_json, color, is_dir, pinned, volume_serial, file_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         target_key,
@@ -526,6 +622,8 @@ class AliasStore:
                         entry.color,
                         int(is_dir_val),
                         int(entry.pinned),
+                        vol_ser,
+                        str(fid),
                         entry.created_at,
                         now,
                     ),

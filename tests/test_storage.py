@@ -163,5 +163,55 @@ class TestAliasStorage(unittest.TestCase):
             migrated_store.close()
 
 
+    def test_ntfs_file_id_auto_follow_on_rename_and_move(self) -> None:
+        import os
+        import shutil
+        from file_alias.file_id import _is_recycle_bin_path
+
+        self.assertTrue(_is_recycle_bin_path(r"D:\$Recycle.Bin\S-1-5-21-1000\$R82A1.pt"))
+        self.assertFalse(_is_recycle_bin_path(r"D:\Projects\RecycleHelper\model.pt"))
+
+        exp_dir = self.root / "exp_raw"
+        exp_dir.mkdir()
+        nested_weight = exp_dir / "weights_ep10.pt"
+        nested_weight.write_bytes(b"ckpt")
+
+        standalone = self.root / "draft_spec.txt"
+        standalone.write_text("hello", encoding="utf-8")
+
+        self.store.upsert(exp_dir, alias="原始实验组", category="默认分类")
+        self.store.upsert(nested_weight, alias="第10轮收敛权重")
+        self.store.upsert(standalone, alias="接口规范初稿")
+
+        # 1. Rename standalone file on disk
+        renamed_file = self.root / "final_spec_v2.txt"
+        os.rename(standalone, renamed_file)
+
+        # 2. Move AND rename parent directory into a new subdirectory
+        archive_root = self.root / "archive_2026"
+        archive_root.mkdir()
+        moved_exp_dir = archive_root / "exp_released"
+        shutil.move(str(exp_dir), str(moved_exp_dir))
+
+        healed = self.store.reconcile_moved_files(force=True)
+        self.assertGreaterEqual(healed, 2)
+
+        # Standalone file alias followed rename automatically
+        self.assertIsNone(self.store.get(standalone))
+        rec_file = self.store.get(renamed_file)
+        self.assertIsNotNone(rec_file)
+        self.assertEqual(rec_file.alias, "接口规范初稿")
+
+        # Moved folder AND nested weight file followed automatically!
+        self.assertIsNone(self.store.get(exp_dir))
+        rec_dir = self.store.get(moved_exp_dir)
+        self.assertIsNotNone(rec_dir)
+        self.assertEqual(rec_dir.alias, "原始实验组")
+
+        rec_nested = self.store.get(moved_exp_dir / "weights_ep10.pt")
+        self.assertIsNotNone(rec_nested)
+        self.assertEqual(rec_nested.alias, "第10轮收敛权重")
+
+
 if __name__ == "__main__":
     unittest.main()

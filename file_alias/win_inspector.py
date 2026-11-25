@@ -251,7 +251,8 @@ class WindowInspector(QObject):
         self._crumb_cache_req = None
         self._crumb_cond = None
         self._timer = QTimer(self)
-        self._timer.setInterval(180)
+        # Safety fallback heartbeat only; primary updates are 0ms event-driven via WinEventMonitor!
+        self._timer.setInterval(1200)
         self._timer.timeout.connect(self._poll)
 
     def _ensure_uia(self) -> bool:

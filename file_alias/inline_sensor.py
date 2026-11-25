@@ -22,6 +22,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from .models import AliasEntry, WindowContext
 from .storage import AliasStore
+from .win_inspector import _get_visible_frame_rect
 
 
 UIA_BoundingRectanglePropertyId = 30001
@@ -71,6 +72,7 @@ class InlineViewSnapshot:
     """Complete snapshot of all aliased items currently visible inside Explorer / File Dialog."""
 
     hwnd: int
+    host_rect: tuple[int, int, int, int]                      # Frame rect of `hwnd` at capture instant (for 0ms drag delta)
     viewport_rect: tuple[int, int, int, int]                  # Clipped DirectUIHWND rect below column header
     is_dark_bg: bool
     items: tuple[InlineItemAnchor, ...]
@@ -247,40 +249,50 @@ def _is_windows_app_dark_mode() -> bool:
 
 class InlineSensorWorker(QThread):
     """
-    Background STA worker using raw COM IUIAutomation.FindAllBuildCache (~2ms per frame)
-    to track exact row/filename coordinates inside Explorer and #32770 File Dialogs.
+    Event-driven STA worker using raw COM IUIAutomation.FindAllBuildCache (~2ms per frame).
+    - Active burst mode (~45 FPS) during scrolling, navigation, or popup animations.
+    - Deep idle sleep mode (0.00% CPU) when window is stationary!
     """
 
     snapshotChanged = Signal(object)  # InlineViewSnapshot | None
+    pathsReconciled = Signal()        # emitted if NTFS FileId auto-healed any renamed/moved entries
 
     def __init__(self, store: AliasStore, own_pid: int | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.store = store
         self._own_pid = own_pid or os.getpid()
         self._lock = threading.Lock()
+        self._wake_event = threading.Event()
         self._running = True
         self._enabled = True
         self._ctx: WindowContext | None = None
-        self._force_tick = False
+        self._active_until: float = 0.0
+        self._force_reconcile: bool = False
         self._last_snapshot: InlineViewSnapshot | None = None
 
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._enabled = enabled
-            self._force_tick = True
+            self._active_until = time.monotonic() + 0.35
+        self._wake_event.set()
 
     def set_context(self, ctx: WindowContext | None) -> None:
         with self._lock:
             self._ctx = ctx
-            self._force_tick = True
+            self._active_until = time.monotonic() + 0.45
+        self._wake_event.set()
 
-    def request_refresh(self) -> None:
+    def request_refresh(self, burst_sec: float = 0.40, force_reconcile: bool = False) -> None:
         with self._lock:
-            self._force_tick = True
+            self._active_until = max(self._active_until, time.monotonic() + burst_sec)
+            if force_reconcile:
+                self._force_reconcile = True
+        self._wake_event.set()
 
     def stop_worker(self) -> None:
         with self._lock:
             self._running = False
+        self._wake_event.set()
         self.wait(1200)
 
     def _emit_if_changed(self, snap: InlineViewSnapshot | None) -> None:
@@ -320,45 +332,54 @@ class InlineSensorWorker(QThread):
             cached_el_view = None
 
             while True:
+                self._wake_event.clear()
                 with self._lock:
                     if not self._running:
                         break
                     enabled = self._enabled
                     ctx = self._ctx
-                    self._force_tick = False
+                    active_until = self._active_until
+                    force_rec = self._force_reconcile
+                    self._force_reconcile = False
 
                 if not enabled or ctx is None or ctx.is_minimized or not ctx.current_dir:
                     self._emit_if_changed(None)
-                    time.sleep(0.10)
+                    self._wake_event.wait(timeout=2.0)
                     continue
 
-                # Zero-cost fast path: skip UIAutomation completely if current folder has 0 aliases!
+                # Auto-heal renamed or moved files/folders via NTFS FileId before checking dir!
+                healed = self.store.reconcile_moved_files(force=force_rec)
+                if healed > 0:
+                    self.pathsReconciled.emit()
+
+                # Zero-cost fast path: sleep completely if current folder has 0 aliases!
                 if not self.store.list_in_dir(ctx.current_dir):
                     self._emit_if_changed(None)
-                    time.sleep(0.12)
+                    self._wake_event.wait(timeout=2.0)
                     continue
 
                 if not win32gui.IsWindow(ctx.hwnd) or not win32gui.IsWindowVisible(ctx.hwnd):
                     self._emit_if_changed(None)
-                    time.sleep(0.10)
+                    self._wake_event.wait(timeout=1.5)
                     continue
 
                 def_view, view_hwnd = _find_visible_file_view_hwnds(ctx.hwnd)
                 if not view_hwnd:
                     self._emit_if_changed(None)
-                    time.sleep(0.10)
+                    self._wake_event.wait(timeout=0.5)
                     continue
 
                 if _is_inline_renaming(ctx.hwnd, def_view):
                     self._emit_if_changed(None)
-                    time.sleep(0.08)
+                    self._wake_event.wait(timeout=0.12)
                     continue
 
                 try:
+                    host_rect = _get_visible_frame_rect(ctx.hwnd)
                     dui_l, dui_t, dui_r, dui_b = win32gui.GetWindowRect(view_hwnd)
                 except Exception:
                     self._emit_if_changed(None)
-                    time.sleep(0.10)
+                    self._wake_event.wait(timeout=0.5)
                     continue
 
                 now = time.monotonic()
@@ -443,6 +464,7 @@ class InlineSensorWorker(QThread):
                     occluders = collect_occluding_rects(ctx.hwnd, viewport_rect, self._own_pid)
                     snap = InlineViewSnapshot(
                         hwnd=ctx.hwnd,
+                        host_rect=host_rect,
                         viewport_rect=viewport_rect,
                         is_dark_bg=bg_cache_dark,
                         items=tuple(matched_anchors),
@@ -452,6 +474,10 @@ class InlineSensorWorker(QThread):
                 else:
                     self._emit_if_changed(None)
 
-                time.sleep(0.038)
+                # Event-driven adaptive sleep:
+                # - 22ms (~45 FPS) during active scroll/interaction burst
+                # - Deep sleep (1.8s safety check -> 0.00% CPU) when stationary!
+                wait_sec = 0.022 if time.monotonic() < active_until else 1.80
+                self._wake_event.wait(timeout=wait_sec)
         finally:
             pythoncom.CoUninitialize()

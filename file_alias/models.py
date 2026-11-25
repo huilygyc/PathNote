@@ -71,6 +71,8 @@ class AliasEntry:
     color: str = "#3B82F6"             # Badge accent color hex
     is_dir: bool = False               # Cached directory indicator
     pinned: bool = False               # Pin to top in companion & search
+    volume_serial: int = 0             # NTFS volume serial number for rename/move tracking
+    file_id: int = 0                   # NTFS 64-bit file index for rename/move tracking
     created_at: float = 0.0
     updated_at: float = 0.0
 

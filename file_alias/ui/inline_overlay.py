@@ -8,7 +8,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QPoint, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QRegion
 from PySide6.QtWidgets import QWidget
 
@@ -92,6 +92,33 @@ class InlineAliasOverlay(QWidget):
             except Exception:
                 pass
         self.update()
+
+    def sync_host_window_move(self, new_host_phys_rect: tuple[int, int, int, int]) -> bool:
+        """
+        0ms rigid-body translation when the host Explorer / File Dialog window is dragged.
+        Moves the overlay canvas at native monitor refresh rate (120Hz+) with zero UIA queries or repaints.
+        Returns True if handled as pure translation, False if window size changed (needs UIA refresh).
+        """
+        snap = self._snapshot
+        if snap is None or not self.isVisible():
+            return True
+
+        base_host_qt, _ = phys_rect_to_qt(snap.host_rect)
+        new_host_qt, _ = phys_rect_to_qt(new_host_phys_rect)
+
+        if (
+            abs(new_host_qt.width() - base_host_qt.width()) > 2
+            or abs(new_host_qt.height() - base_host_qt.height()) > 2
+        ):
+            return False
+
+        base_vp_qt, _ = phys_rect_to_qt(snap.viewport_rect)
+        dx = new_host_qt.left() - base_host_qt.left()
+        dy = new_host_qt.top() - base_host_qt.top()
+        target_top_left = QPoint(base_vp_qt.left() + dx, base_vp_qt.top() + dy)
+        if self.pos() != target_top_left:
+            self.move(target_top_left)
+        return True
 
     def paintEvent(self, _event) -> None:
         snap = self._snapshot
